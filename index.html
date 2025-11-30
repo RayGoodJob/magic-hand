@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 隔空手写板 (MediaPipe)</title>
+    <style>
+        body { margin: 0; padding: 0; background: #111; overflow: hidden; font-family: sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        /* 视频层：镜像翻转，看起来像照镜子 */
+        #webcam { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+        /* 画布层：覆盖在视频之上 */
+        #output_canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+        /* 加载提示 */
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 24px; background: rgba(0,0,0,0.7); padding: 20px; border-radius: 10px; z-index: 100; pointer-events: none; }
+        /* 调试/状态信息 */
+        #status { position: absolute; top: 10px; left: 10px; color: #0f0; font-size: 16px; background: rgba(0,0,0,0.5); padding: 5px; z-index: 50; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="loading">正在加载 AI 模型，请稍候...</div>
+    <div id="status">状态: 初始化中...</div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+const video = document.getElementById('webcam');
+const canvas = document.getElementById('output_canvas');
+const ctx = canvas.getContext('2d');
+const loadingDiv = document.getElementById('loading');
+const statusDiv = document.getElementById('status');
+
+let handLandmarker = undefined;
+let lastVideoTime = -1;
+let results = undefined;
+
+// --- 状态变量 ---
+let strokes = []; // 存储所有笔画: [{points: [{x,y}], color, size, isEraser}]
+let currentStroke = null;
+let particles = []; // 雪花粒子
+
+// 画笔设置
+let toolState = {
+    color: '#00FF00', // 默认绿色
+    size: 5,
+    mode: 'pen', // 'pen' or 'eraser'
+    menuOpen: false
+};
+
+// 手势交互变量
+let isPinching = false;
+let pinchStartPoint = null;
+let lastPinchCenter = null;
+
+// 缩放相关
+let isZooming = false;
+let baseZoomDist = 0;
+let canvasScale = 1;
+let canvasOffset = { x: 0, y: 0 };
+let lastCanvasScale = 1;
+
+// 菜单防抖
+let menuToggleCooldown = 0;
+
+// UI 布局定义
+const UI_BUTTONS = [
+    { id: 'pen', label: '✏️ 笔', type: 'tool', value: 'pen', x: 50, y: 100, w: 80, h: 60, color: '#fff' },
+    { id: 'eraser', label: '🧹 擦', type: 'tool', value: 'eraser', x: 50, y: 170, w: 80, h: 60, color: '#fff' },
+    { id: 'red', label: '🔴', type: 'color', value: '#FF0000', x: 140, y: 100, w: 60, h: 60, color: '#FF0000' },
+    { id: 'green', label: '🟢', type: 'color', value: '#00FF00', x: 140, y: 170, w: 60, h: 60, color: '#00FF00' },
+    { id: 'blue', label: '🔵', type: 'color', value: '#0000FF', x: 210, y: 100, w: 60, h: 60, color: '#0000FF' },
+    { id: 'size_s', label: '小', type: 'size', value: 3, x: 210, y: 170, w: 60, h: 60, color: '#aaa' },
+    { id: 'size_l', label: '大', type: 'size', value: 10, x: 280, y: 170, w: 60, h: 60, color: '#aaa' },
+];
+
+let hoverTimer = 0;
+let lastHoverId = null;
+
+// --- 1. 初始化 MediaPipe ---
+async function createHandLandmarker() {
+    const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+    });
+    loadingDiv.style.display = 'none';
+    startCamera();
+}
+
+// --- 2. 开启摄像头 ---
+function startCamera() {
+    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } }).then((stream) => {
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictWebcam);
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+    });
+}
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+
+// --- 核心循环 ---
+async function predictWebcam() {
+    // 设置 Canvas 尺寸匹配视频流比例 (保持全屏覆盖)
+    if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        results = handLandmarker.detectForVideo(video, performance.now());
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    // 逻辑处理
+    handleGestures();
+    
+    // 渲染处理
+    drawStrokes();
+    drawParticles(); // 雪花特效
+    drawUI();        // 如果菜单打开
+    drawCursor();    // 绘制手势反馈点
+
+    requestAnimationFrame(predictWebcam);
+}
+
+// --- 3. 手势逻辑处理 ---
+function handleGestures() {
+    if (!results || !results.landmarks || results.landmarks.length === 0) {
+        statusDiv.innerText = "状态: 未检测到手";
+        return;
+    }
+
+    const hands = results.landmarks;
+    const handedness = results.handedness; // Left/Right check
+
+    // 冷却时间递减
+    if (menuToggleCooldown > 0) menuToggleCooldown--;
+
+    // 检测单手操作
+    if (hands.length === 1) {
+        const lm = hands[0];
+        
+        // 1. 检测是否张开手掌 (Open Palm) -> Toggle Menu
+        if (detectOpenPalm(lm) && menuToggleCooldown === 0) {
+            toolState.menuOpen = !toolState.menuOpen;
+            menuToggleCooldown = 60; // 1秒冷却
+            statusDiv.innerText = toolState.menuOpen ? "状态: 菜单开启" : "状态: 菜单关闭";
+        }
+
+        // 2. 菜单模式下的交互 (Menu Mode Interaction)
+        if (toolState.menuOpen) {
+            handleMenuInteraction(lm);
+            return; // 菜单开启时，不进行书写
+        }
+
+        // 3. 检测清除手势 (Victory/Peace Sign) -> Clear & Snow
+        if (detectVictorySign(lm)) {
+            triggerSnowEffect();
+            statusDiv.innerText = "状态: 清除画布";
+            return;
+        }
+
+        // 4. 检测书写手势 (Pinch) -> Write
+        const pinchDist = distance(lm[4], lm[8]); // 拇指与食指
+        if (pinchDist < 0.05) { // 阈值，根据摄像头距离可能需要微调
+            isPinching = true;
+            statusDiv.innerText = toolState.mode === 'eraser' ? "状态: 橡皮擦" : "状态: 书写中";
+            
+            // 坐标转换 (归一化 -> 屏幕坐标)
+            const x = lm[8].x * canvas.width;
+            const y = lm[8].y * canvas.height;
+
+            // 反向应用缩放，以便将笔画记录在“世界坐标”中
+            const worldX = (x - canvasOffset.x) / canvasScale;
+            const worldY = (y - canvasOffset.y) / canvasScale;
+
+            if (!currentStroke) {
+                currentStroke = {
+                    points: [{x: worldX, y: worldY}],
+                    color: toolState.color,
+                    size: toolState.size,
+                    isEraser: toolState.mode === 'eraser'
+                };
+                strokes.push(currentStroke);
+            } else {
+                currentStroke.points.push({x: worldX, y: worldY});
+            }
+        } else {
+            isPinching = false;
+            currentStroke = null;
+            if (!toolState.menuOpen) statusDiv.innerText = "状态: 准备书写";
+        }
+    } 
+    // 双手操作
+    else if (hands.length === 2) {
+        // 5. 检测双手缩放 (Zoom)
+        // 假设左右手都是食指伸出
+        const h1 = hands[0];
+        const h2 = hands[1];
+        
+        // 简单判断：只要不是捏合状态，且两个食指都伸出
+        if (!detectPinch(h1) && !detectPinch(h2)) {
+            const idx1 = { x: h1[8].x * canvas.width, y: h1[8].y * canvas.height };
+            const idx2 = { x: h2[8].x * canvas.width, y: h2[8].y * canvas.height };
+            
+            const dist = Math.hypot(idx1.x - idx2.x, idx1.y - idx2.y);
+            const cx = (idx1.x + idx2.x) / 2;
+            const cy = (idx1.y + idx2.y) / 2;
+
+            if (!isZooming) {
+                isZooming = true;
+                baseZoomDist = dist;
+                lastCanvasScale = canvasScale; // 记录开始时的缩放
+                statusDiv.innerText = "状态: 缩放中...";
+            } else {
+                // 计算新的缩放比例
+                const ratio = dist / baseZoomDist;
+                const newScale = lastCanvasScale * ratio;
+                
+                // 限制缩放范围
+                if (newScale > 0.5 && newScale < 5.0) {
+                    // 简单的缩放逻辑：以屏幕中心为基准（更复杂的需要以双手中心为基准）
+                    // 为了简化代码，这里实现以屏幕中心缩放
+                    canvasScale = newScale;
+                    
+                    // 如果想要以双手中心缩放，需要复杂的矩阵偏移计算，此处简化处理
+                }
+            }
+        } else {
+            isZooming = false;
+        }
+    }
+}
+
+// --- 辅助检测函数 ---
+
+function distance(p1, p2) {
+    return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+}
+
+// 检测捏合 (辅助用)
+function detectPinch(lm) {
+    return distance(lm[4], lm[8]) < 0.05;
+}
+
+// 检测张开手掌: 所有手指指尖距离掌心(0)比关节距离掌心远，且手指是分开的
+function detectOpenPalm(lm) {
+    // 简单判断：指尖(8,12,16,20) y坐标小于关节(6,10,14,18) y坐标 (注意坐标系y向下)
+    // 但手可能旋转。更好的方法是判断手指是否伸直。
+    // 这里使用：食指、中指、无名指、小指 都是伸直状态
+    const isExtended = (tip, pip) => distance(lm[tip], lm[0]) > distance(lm[pip], lm[0]) * 1.2;
+    
+    return isExtended(8, 6) && isExtended(12, 10) && isExtended(16, 14) && isExtended(20, 18) && distance(lm[4], lm[8]) > 0.1;
+}
+
+// 检测 Victory/Peace (剪刀手): 食指中指伸直，无名指小指弯曲
+function detectVictorySign(lm) {
+    const isExtended = (tip, pip) => distance(lm[tip], lm[0]) > distance(lm[pip], lm[0]);
+    const isCurled = (tip, pip) => distance(lm[tip], lm[0]) < distance(lm[pip], lm[0]);
+    
+    // 食指中指伸直，无名指小指弯曲
+    return isExtended(8, 6) && isExtended(12, 10) && isCurled(16, 14) && isCurled(20, 18);
+}
+
+// --- 菜单交互 ---
+function handleMenuInteraction(lm) {
+    const indexTip = { x: lm[8].x * canvas.width, y: lm[8].y * canvas.height };
+    
+    let hovered = false;
+
+    // 绘制指尖光标
+    ctx.beginPath();
+    ctx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.fill();
+
+    for (let btn of UI_BUTTONS) {
+        // 简单的矩形碰撞检测
+        if (indexTip.x > btn.x && indexTip.x < btn.x + btn.w &&
+            indexTip.y > btn.y && indexTip.y < btn.y + btn.h) {
+            
+            hovered = true;
+            // 绘制进度环
+            ctx.beginPath();
+            ctx.arc(indexTip.x, indexTip.y, 15, 0, (hoverTimer / 30) * Math.PI * 2);
+            ctx.strokeStyle = 'yellow';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            if (lastHoverId !== btn.id) {
+                lastHoverId = btn.id;
+                hoverTimer = 0;
+            } else {
+                hoverTimer++;
+                if (hoverTimer > 30) { // 停留约 0.5-1秒 触发
+                    triggerButton(btn);
+                    hoverTimer = 0;
+                    toolState.menuOpen = false; // 选择后自动关闭菜单，根据需求
+                    menuToggleCooldown = 30;
+                }
+            }
+        }
+    }
+
+    if (!hovered) {
+        hoverTimer = 0;
+        lastHoverId = null;
+    }
+}
+
+function triggerButton(btn) {
+    if (btn.type === 'color') {
+        toolState.color = btn.value;
+        toolState.mode = 'pen';
+    } else if (btn.type === 'tool') {
+        toolState.mode = btn.value;
+    } else if (btn.type === 'size') {
+        toolState.size = btn.value;
+    }
+    console.log("Selected:", btn.id);
+}
+
+// --- 渲染函数 ---
+
+function drawUI() {
+    if (!toolState.menuOpen) return;
+
+    ctx.save();
+    // 恢复到屏幕坐标系绘制UI (不受缩放影响)
+    ctx.setTransform(1, 0, 0, 1, 0, 0); 
+    // 还要处理镜像翻转问题，因为CSS翻转了Canvas，文字会反。
+    // 我们的CSS transform: scaleX(-1)。
+    // 为了让字正过来，我们需要在绘制UI时再次翻转，或者直接画反的字。
+    // 最简单的方案：在绘制文字时 scale(-1, 1) 并调整位置。
+    
+    // 背景遮罩
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(20, 80, 400, 200);
+
+    UI_BUTTONS.forEach(btn => {
+        // 按钮背景
+        ctx.fillStyle = btn.id === lastHoverId ? "#555" : "#333";
+        if (
+            (btn.type === 'color' && toolState.color === btn.value && toolState.mode === 'pen') ||
+            (btn.type === 'tool' && toolState.mode === btn.value) ||
+            (btn.type === 'size' && toolState.size === btn.value)
+        ) {
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+        }
+        
+        ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+
+        // 内容
+        if (btn.type === 'color') {
+            ctx.fillStyle = btn.value;
+            ctx.beginPath();
+            ctx.arc(btn.x + btn.w/2, btn.y + btn.h/2, 15, 0, Math.PI*2);
+            ctx.fill();
+        } else {
+            ctx.save();
+            // 处理文字镜像问题：
+            // 当前CSS flip了整个canvas。
+            // 我们需要在绘制文字时，先 translate 到文字中心，scale(-1, 1)，再绘制。
+            ctx.translate(btn.x + btn.w/2, btn.y + btn.h/2);
+            ctx.scale(-1, 1); 
+            ctx.fillStyle = btn.color;
+            ctx.font = "20px Arial";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(btn.label, 0, 0);
+            ctx.restore();
+        }
+    });
+
+    // 文字提示
+    ctx.save();
+    ctx.translate(220, 50);
+    ctx.scale(-1, 1);
+    ctx.fillStyle = "white";
+    ctx.font = "20px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("食指悬停选择", 0, 0);
+    ctx.restore();
+
+    ctx.restore();
+}
+
+function drawStrokes() {
+    ctx.save();
+    
+    // 应用缩放和平移
+    // 简单以左上角或屏幕中心为基点
+    // 这里的 translate 是基于 scale 的
+    ctx.translate(canvas.width/2, canvas.height/2);
+    ctx.scale(canvasScale, canvasScale);
+    ctx.translate(-canvas.width/2, -canvas.height/2);
+    
+    // 绘制笔画
+    strokes.forEach(stroke => {
+        if (stroke.points.length < 2) return;
+        
+        ctx.beginPath();
+        ctx.lineWidth = stroke.size;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        
+        if (stroke.isEraser) {
+            ctx.globalCompositeOperation = 'destination-out'; // 擦除模式
+            ctx.lineWidth = stroke.size * 3; // 橡皮擦大一点
+        } else {
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.strokeStyle = stroke.color;
+        }
+
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        for (let i = 1; i < stroke.points.length; i++) {
+            ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+        }
+        ctx.stroke();
+    });
+
+    ctx.restore();
+    ctx.globalCompositeOperation = 'source-over'; // 恢复
+}
+
+function drawCursor() {
+    // 仅用于调试或非菜单模式下的手指位置提示
+    if (!results || !results.landmarks) return;
+    
+    ctx.save();
+    // 不受 global scale 影响
+    ctx.setTransform(1, 0, 0, 1, 0, 0); 
+
+    for (const landmarks of results.landmarks) {
+        // 绘制食指
+        const x = landmarks[8].x * canvas.width;
+        const y = landmarks[8].y * canvas.height;
+        
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, Math.PI*2);
+        ctx.fillStyle = isPinching ? 'red' : 'cyan';
+        ctx.fill();
+
+        // 如果捏合，绘制拇指连接线
+        if (isPinching) {
+             const tx = landmarks[4].x * canvas.width;
+             const ty = landmarks[4].y * canvas.height;
+             ctx.beginPath();
+             ctx.moveTo(x,y);
+             ctx.lineTo(tx,ty);
+             ctx.strokeStyle = 'white';
+             ctx.stroke();
+        }
+    }
+    ctx.restore();
+}
+
+// --- 雪花粒子特效 ---
+
+class Particle {
+    constructor(x, y, color) {
+        this.x = x;
+        this.y = y;
+        this.color = color;
+        this.vx = (Math.random() - 0.5) * 2; // 水平飘动
+        this.vy = Math.random() * 2 + 1;     // 下落速度
+        this.life = 1.0;                     // 透明度
+        this.decay = Math.random() * 0.01 + 0.005;
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= this.decay;
+    }
+    draw(ctx) {
+        ctx.globalAlpha = this.life;
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, 3, 3); // 绘制像素点
+        ctx.globalAlpha = 1.0;
+    }
+}
+
+function triggerSnowEffect() {
+    if (strokes.length === 0) return;
+
+    // 将所有笔画的点转化为粒子
+    strokes.forEach(stroke => {
+        // 采样点，不要每个点都转化，否则太卡
+        for (let i = 0; i < stroke.points.length; i += 2) {
+            const p = stroke.points[i];
+            // 考虑当前的缩放状态，将世界坐标转回屏幕视觉坐标产生粒子
+            // 简单起见，直接用世界坐标飘落，但在视觉上加上缩放
+            // 为了效果好，直接清空 strokes，生成屏幕坐标系的粒子
+            
+            // 将 World P 转换为 Screen P
+            // ScreenX = (WorldX - CW/2) * Scale + CW/2
+            const screenX = (p.x - canvas.width/2) * canvasScale + canvas.width/2;
+            const screenY = (p.y - canvas.height/2) * canvasScale + canvas.height/2;
+
+            if (screenX > 0 && screenX < canvas.width && screenY > 0 && screenY < canvas.height) {
+                particles.push(new Particle(screenX, screenY, stroke.color));
+            }
+        }
+    });
+
+    strokes = []; // 清空笔画
+    // 重置缩放，否则新画的会乱
+    canvasScale = 1;
+}
+
+function drawParticles() {
+    if (particles.length === 0) return;
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0); // 粒子不受画板缩放影响，直接在屏幕层飘落
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.update();
+        p.draw(ctx);
+        if (p.life <= 0) {
+            particles.splice(i, 1);
+        }
+    }
+    ctx.restore();
+}
+
+// 启动
+createHandLandmarker();
+
+</script>
+</body>
+</html>
